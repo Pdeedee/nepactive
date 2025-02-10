@@ -1,0 +1,33 @@
+ini_engine: ase
+ini_ase_ensemble_files: ["/workplace/liuzf/code/nepactive/example/prep/run_npt.py", "/workplace/liuzf/code/nepactive/example/prep/run_npt.py"]
+python_interpreter: "/workplace/liuzf/miniforge3/envs/mattersim/bin/python"
+ini_frames: 10
+training_ratio: 0.8
+pot_file: "/workplace/liuzf/ase/n5/30GPa300/best_model.pth"
+
+#model_devi
+nep_template: "/workplace/liuzf/code/nepactive/example/prep/nep.in"
+pot_number: 4
+model_devi:
+  -
+    id: 0
+    gpumd_template: ["/workplace/liuzf/code/nepactive/example/prep/run.in", "/workplace/liuzf/code/nepactive/example/prep/run.in"]#写teplate文件的地址
+    xyz_file: "/workplace/liuzf/code/nepactive/example/prep/model.xyz"
+  -
+    id: 1
+    gpumd_template: ["/workplace/liuzf/code/nepactive/example/prep/run.in", "/workplace/liuzf/code/nepactive/example/prep/run.in"]
+    xyz_file: "/workplace/liuzf/code/nepactive/example/prep/model.xyz"
+  -
+    id: 2
+    gpumd_template: ["/workplace/liuzf/code/nepactive/example/prep/run.in", "/workplace/liuzf/code/nepactive/example/prep/run.in"]
+    xyz_file: "/workplace/liuzf/code/nepactive/example/prep/model.xyz"
+#目前只有相对误差
+uncertaity_threshold_low: 0.2
+uncertainty_threshold_high: 1
+uncertainty_level: 1
+
+#ssh_machine
+ssh_username: "liuzf"
+ssh_hostname: ""
+ssh_port: 22
+
