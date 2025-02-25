@@ -706,24 +706,24 @@ class Nepactive():
         work_dir = os.path.join(iter_dir, "02.label")
         train_ratio = self.idata.get("training_ratio", 0.8)
         os.chdir(work_dir)
-        atoms = read("candidate.xyz", index=":", format="extxyz")
+        atoms_list = read("candidate.xyz", index=":", format="extxyz")
         self.pot_file = self.idata.get("pot_file")
         # 创建MatterSimCalculator对象，用于计算原子能量
-        Nepactive.run_mattersim(pot_file=pot_file,train_ratio=train_ratio)
+        Nepactive.run_mattersim(atoms_list=atoms_list, pot_file=pot_file, train_ratio=train_ratio)
 
     @classmethod
-    def run_mattersim(cls,pot_file:str,train_ratio:float=0.8):
-        calculator = MatterSimCalculator(load_path=self.pot_file,device="cuda")
+    def run_mattersim(cls, atoms_list:List[Atoms], pot_file:str, train_ratio:float=0.8):
+        calculator = MatterSimCalculator(load_path=pot_file,device="cuda")
         traj = Trajectory('candidate.traj', mode='a')
 
-        def change_calc(atom:Atom):
-            atom._calc=calculator
-            atom.get_potential_energy()
-            traj.write(atom)
-            return atom
+        def change_calc(atoms:Atoms):
+            atoms._calc=calculator
+            atoms.get_potential_energy()
+            traj.write(atoms)
+            return atoms
         # 对每个原子调用change_calc函数，将计算结果写入Trajectory对象
         # atoms = [change_calc(atoms[i]) for i in tqdm(range(len(atoms)))]    
-        atoms = [change_calc(atoms[i]) for i in range(len(atoms))]    
+        atoms = [change_calc(atoms_list[i]) for i in range(len(atoms_list))]    
         # 读取Trajectory对象中的原子信息
         atoms = read("candidate.traj",index=":")
         train:List[Atoms]=[]

@@ -9,7 +9,7 @@ velocity		300
 
 ensemble        nvt_ber 300 300 200 # 0 0 0 10 0 0 258 258 258 77.5 77.5 253 1000
 
-dump_thermo		{dump_freq}
+# dump_thermo		{dump_freq}
 
 run			    20000
 
