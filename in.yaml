@@ -1,33 +1,130 @@
-ini_engine: ase
-ini_ase_ensemble_files: ["/workplace/liuzf/code/nepactive/example/prep/run_npt.py", "/workplace/liuzf/code/nepactive/example/prep/run_npt.py"]
+project_name: "TNT"
+
+ini_engine: "ase"
+ini_ase_ensemble_files: ["prep/npt.py", "prep/msst.py", "prep/npt_stable.py"]
 python_interpreter: "/workplace/liuzf/miniforge3/envs/mattersim/bin/python"
-ini_frames: 10
+ini_frames: 3000
 training_ratio: 0.8
-pot_file: "/workplace/liuzf/ase/n5/30GPa300/best_model.pth"
+pot_file: "/home/liuzf/.local/mattersim/pretrained_models/mattersim-v1.0.0-1M.pth"
+
+structure_prefix: "/workplace/liuzf/code/nepactive/example/iteractive/prep/"
+structure_files: ["POSCAR","N2_CO2_NH3.pdb","N2_CO_H2O.pdb"]
+kpoins_file: "prep/KPOINTS"
+incar_file: "prep/INCAR"
+potcar_file: "prep/POTCAR"
 
 #model_devi
-nep_template: "/workplace/liuzf/code/nepactive/example/prep/nep.in"
+nep_template: "prep/nep.in"
 pot_number: 4
+pot_inherit: true
+max_candidate: 2000
+model_devi_time_step: 0.2
+gpu_available: [0,1,2,3]
+task_per_gpu: 1
+dump_freq: 10
+time_step: 0.2
 model_devi:
   -
     id: 0
-    gpumd_template: ["/workplace/liuzf/code/nepactive/example/prep/run.in", "/workplace/liuzf/code/nepactive/example/prep/run.in"]#写teplate文件的地址
-    xyz_file: "/workplace/liuzf/code/nepactive/example/prep/model.xyz"
+    ensemble: ["msst"]
+    structure_id: [0]
+    run_steps: 800000
+    v_shock: [7,8,8.5,9]
   -
     id: 1
-    gpumd_template: ["/workplace/liuzf/code/nepactive/example/prep/run.in", "/workplace/liuzf/code/nepactive/example/prep/run.in"]
-    xyz_file: "/workplace/liuzf/code/nepactive/example/prep/model.xyz"
+    ensemble: ["msst"]
+    structure_id: [0]
+    run_steps: 1000000
+    v_shock: [7,8,8.5,9]
   -
     id: 2
-    gpumd_template: ["/workplace/liuzf/code/nepactive/example/prep/run.in", "/workplace/liuzf/code/nepactive/example/prep/run.in"]
-    xyz_file: "/workplace/liuzf/code/nepactive/example/prep/model.xyz"
+    ensemble: ["msst"]
+    structure_id: [0]
+    run_steps: 1000000
+    v_shock: [7,8,8.5,9]
+
+  -
+    id: 3
+    ensemble: ["msst"]
+    structure_id: [0]
+    run_steps: 1000000
+    v_shock: [7,8,8.5,9]
+
+  -
+    id: 4
+    ensemble: ["msst"]
+    structure_id: [0]
+    run_steps: 1000000
+    v_shock: [7,8,8.5,9]
+
+  -
+    id: 5
+    ensemble: ["nphugo"]
+    structure_id: [1,2]
+    pressure: [10,20,30,40]
+    run_steps: 400000
+    v0: [1740.84]  
+    e0: [-1022.44]  
+    p0: [1]
+  -
+    id: 6
+    ensemble: ["nphugo"]
+    structure_id: [0,1,2]
+    pressure: [20,25,30,40]
+    run_steps: 400000
+    v0: [1740.84]  
+    e0: [-1022.44]  
+    p0: [1]
+  -
+    id: 7
+    ensemble: ["nphugo"]
+    structure_id: [0,1,2]
+    pressure: [20,25,30,40]
+    run_steps: 400000
+    v0: [1740.84]  
+    e0: [-1022.44]  
+    p0: [1]
+  -
+    id: 8
+    ensemble: ["nphugo"]
+    structure_id: [0,1,2]
+    pressure: [20,25,30,40]
+    run_steps: 800000
+    v0: [1740.84]  
+    e0: [-1022.44]  
+    p0: [1]
+  -
+    id: 9
+    ensemble: ["nphugo"]
+    structure_id: [0,1,2]
+    pressure: [20,25,30,40]
+    run_steps: 1600000
+    v0: [1740.84]  
+    e0: [-1022.44]
+    p0: [1]
 #目前只有相对误差
-uncertaity_threshold_low: 0.2
-uncertainty_threshold_high: 1
+uncertainty_threshold_low: 0.2
+uncertainty_threshold_high: 0.6
 uncertainty_level: 1
 
 #ssh_machine
-ssh_username: "liuzf"
-ssh_hostname: ""
+fp_command: "mpirun -np 96 vasp_std"
+ssh_username: "sch9797@BSCC-T6"
+ssh_hostname: "ssh.cn-zhongwei-1.paracloud.com"
 ssh_port: 22
+
+
+ssh_timeout: 20
+remote_root: "/public1/home/sch9797/liu/nep"
+group_numbers: 10
+slurm_header_script:
+  - "#!/bin/bash"
+  - "#SBATCH --job-name=gpumd"
+  - "#SBATCH -p v6_384"
+  - "#SBATCH -N 1"
+  - "#SBATCH -n 96"
+  - "source /public1/soft/modules/module.sh"
+  - "module load mpi/oneAPI/2022.1"
+  - "export PATH=/public1/home/sch9797/software-sch9797/6.3.0-vtst+opt+sol+wannier:$PATH"
+
 
