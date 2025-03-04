@@ -18,20 +18,25 @@ import uuid
 import json
 from enum import IntEnum
 from hashlib import sha1
+import random
+import numpy as np
 # from dpdispatcher.contexts.ssh_context import SSHSession
 
-def traj2tasks():
-    traj_file = glob("candidate.traj")[0]
-    if os.path.isfile("KPOINTS"):
-        kpoint_file = glob("KPOINTS")[0]
-    incar_file = glob("INCAR")[0]
-    potcar_file = glob("POTCAR")[0]
+def traj2tasks(traj_file:str,incar_file:str,potcar_file:str,frames:int, kpoint_file:Optional[str]=None):
+    """
+    需要在当前文件夹下准备好candidate.traj文件与INCAR，POTCAR文件,然后执行nepactive --remote
+    """
     traj = read(traj_file, index=':')
-    for i, frame in enumerate(traj):
+    index = random.sample(range(len(traj)),frames)
+    index.sort()
+    index = np.array(index,dtype="int32")
+    sorted_traj = [traj[i] for i in index]
+    np.savetxt("index.txt", index)
+    for i, frame in enumerate(sorted_traj):
         folder_name = f'task.{i:06d}'
         os.makedirs(folder_name, exist_ok=True)
         write(f'{folder_name}/POSCAR', frame, format='vasp')
-        if os.path.isfile("KPOINTS"):
+        if kpoint_file:
             shutil.copyfile(kpoint_file,f"{folder_name}/KPOINTS")
         shutil.copyfile(incar_file,f"{folder_name}/INCAR")
         shutil.copyfile(potcar_file,f"{folder_name}/POTCAR")
@@ -244,9 +249,10 @@ touch {group_tag}_job_tag_finished
 """
 
 class Remotetask:
-    def __init__(self,idata:dict, tar_suffix = None):
+    def __init__(self,idata:dict):
         self.idata:dict = idata
         self.work_dir = os.getcwd()
+        tar_suffix = idata.get('tar_suffix')
         self.project_name = idata.get('project_name')
         if tar_suffix is not None:
             self.tar_fileprefix = f"{self.project_name}_{tar_suffix}"
@@ -265,9 +271,7 @@ class Remotetask:
         self.remotename = f"{self.username}@{self.hostname}"
         self.port = idata.get('ssh_port')
         self.password = idata.get('ssh_password', None)
-        self.fs = self.glob_files()
-        self.tasks = self.glob_files("task.*")
-        self.tasks = [os.path.basename(task) for task in self.tasks]
+
         self.remote_root = idata.get('remote_root')
         self.timeout = 10
         self.passphrase = None
@@ -287,13 +291,27 @@ class Remotetask:
         path = os.path.join(self.work_dir, name)
         return glob(path)
 
+    def setup(self):
+        if not os.path.exists("task.000000"):
+            traj_file = self.idata.get('remotetask_traj_file')
+            incar_file = self.idata.get('incar_file')
+            potcar_file = self.idata.get('potcar_file')
+            frames = self.idata.get('remotetask_frames')
+            dlog.info(f"find traj_file:{traj_file}, incar_file:{incar_file}, potcar_file:{potcar_file}, frames:{frames}")
+            assert frames
+            traj2tasks(traj_file=traj_file, incar_file=incar_file, potcar_file=potcar_file, frames=frames)
+        self.fs = self.glob_files()
+        self.tasks = self.glob_files("task.*")
+        self.tasks = [os.path.basename(task) for task in self.tasks]
+
     def run_submission(self):
         # 创建SSH对象
         os.chdir(self.work_dir)
+        # self.task_prepared = self.idata.get('task_prepared', False)
+        self.setup()
         files = os.listdir(self.work_dir)
         cur_files = [file for file in files if file.startswith('cur_job')]
         jj = 3
-
         if cur_files:
             dlog.info(f"找到以下 'cur' 开头的文件:{cur_files}")
             jj =4
@@ -326,6 +344,10 @@ class Remotetask:
             dlog.info("Files downloaded")
             os.chdir(self.work_dir)
             os.system("touch finished")
+            clean = self.idata.get('clean', True)
+            
+            if clean:
+                self.sftp.rmdir(f"{self.remote_root}/{self.tar_fileprefix}")
         else:
             raise ValueError("jj must be 3 or 4")
         
@@ -457,7 +479,6 @@ class Remotetask:
     
     def put_files(self):
         self.tar_files()
-
         try:
             self.sftp.mkdir(f"{self.remote_root}/{self.tar_fileprefix}")
         except OSError:
@@ -466,6 +487,8 @@ class Remotetask:
         self.rsync(from_f = self.tar_filename, to_f = f"{self.idata.get('remote_root')}/{self.tar_fileprefix}")
 
         self.block_checkcall(f"cd {self.remote_root}/{self.tar_fileprefix} &&tar -xzf {self.tar_filename}")
+
+        os.remove(self.tar_filename)
 
     def check_status(self, job:Job):
         job_id = job.job_id
@@ -611,7 +634,7 @@ class Remotetask:
         # self.remote_tar_files()
         dlog.info(f"beginning to rsync files in {self.work_dir}")
         #/号很重要
-        additional_args = ["--exclude=*.tar.gz", "--exclude=*log", "--exclude=*out","--exclude=*.xml", "--exclude=POTCAR","--exclude=XDATCAR", "/src","/dst"]
+        additional_args = ["--exclude=*.tar.gz", "--exclude=*log", "--exclude=*out","--exclude=*/*.xml", "--exclude=*/POTCAR","--exclude=*/XDATCAR"]
         self.rsync(from_f = f"{self.remote_root}/{self.tar_fileprefix}/", to_f = self.work_dir, send = False, additional_args=additional_args)
         dlog.info(f"rsync files in {self.work_dir} successfully")
         # with tarfile.open(self.tar_filename, mode='r:gz') as tar:
@@ -827,6 +850,7 @@ class Remotetask:
                 
     def group_tasks(self):
         group_numbers = self.idata.get('group_numbers',4)
+        dlog.info(f"will split tasks into {group_numbers} groups")
         task_numbers = len(self.tasks)
         group_size = math.ceil(task_numbers/ group_numbers)
         groups = [self.tasks[i:i+group_size] for i in range(0, task_numbers, group_size)]

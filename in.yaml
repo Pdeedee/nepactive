@@ -1,9 +1,10 @@
 project_name: "TNT"
+yaml_synchro: true
 
 ini_engine: "ase"
 ini_ase_ensemble_files: ["prep/npt.py", "prep/msst.py", "prep/npt_stable.py"]
 python_interpreter: "/workplace/liuzf/miniforge3/envs/mattersim/bin/python"
-ini_frames: 3000
+ini_frames: 1500
 training_ratio: 0.8
 pot_file: "/home/liuzf/.local/mattersim/pretrained_models/mattersim-v1.0.0-1M.pth"
 
@@ -17,9 +18,9 @@ potcar_file: "prep/POTCAR"
 nep_template: "prep/nep.in"
 pot_number: 4
 pot_inherit: true
-max_candidate: 2000
+max_candidate: 1500
 model_devi_time_step: 0.2
-gpu_available: [0,1,2,3]
+gpu_available: [0,1,2,2]
 task_per_gpu: 1
 dump_freq: 10
 time_step: 0.2
@@ -37,27 +38,6 @@ model_devi:
     run_steps: 1000000
     v_shock: [7,8,8.5,9]
   -
-    id: 2
-    ensemble: ["msst"]
-    structure_id: [0]
-    run_steps: 1000000
-    v_shock: [7,8,8.5,9]
-
-  -
-    id: 3
-    ensemble: ["msst"]
-    structure_id: [0]
-    run_steps: 1000000
-    v_shock: [7,8,8.5,9]
-
-  -
-    id: 4
-    ensemble: ["msst"]
-    structure_id: [0]
-    run_steps: 1000000
-    v_shock: [7,8,8.5,9]
-
-  -
     id: 5
     ensemble: ["nphugo"]
     structure_id: [1,2]
@@ -72,7 +52,7 @@ model_devi:
     structure_id: [0,1,2]
     pressure: [20,25,30,40]
     run_steps: 400000
-    v0: [1740.84]  
+    v0: [1740.84]
     e0: [-1022.44]  
     p0: [1]
   -
@@ -103,9 +83,10 @@ model_devi:
     e0: [-1022.44]
     p0: [1]
 #目前只有相对误差
-uncertainty_threshold_low: 0.2
-uncertainty_threshold_high: 0.6
+uncertainty_threshold: [0.2, 0.5]
 uncertainty_level: 1
+uncertainty_method: "mean"
+energy_threshold: 1
 
 #ssh_machine
 fp_command: "mpirun -np 96 vasp_std"

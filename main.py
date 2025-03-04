@@ -1,4 +1,4 @@
-from nepactive import dlog
+from nepactive import dlog,parse_yaml
 from nepactive.train import Nepactive
 from nepactive.remote import Remotetask
 import logging
@@ -8,11 +8,7 @@ import yaml
 
 # 创建解析器
 
-def parse_yaml(file):
-    with open('in.yaml', 'r') as file:
-        data = yaml.safe_load(file)
-        # data = yaml.safe_load("in.yaml")
-    return data
+
 
 def _main():
     parser = argparse.ArgumentParser(description="nepactive")

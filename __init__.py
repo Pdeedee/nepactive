@@ -1,6 +1,7 @@
 import logging
 import os
-    
+import yaml
+
 ROOT_PATH = __path__[0]
 NAME = "nepactive"
 SHORT_CMD = "nepactive"
@@ -12,3 +13,9 @@ dlogf_formatter = logging.Formatter('%(asctime)s - %(name)s - [%(filename)s:%(fu
 dlogf.setFormatter(dlogf_formatter)
 dlog.addHandler(dlogf)
 logging.basicConfig(level=logging.WARNING)
+
+def parse_yaml(file):
+    with open(file, encoding='utf-8') as f:
+        data = yaml.safe_load(f)
+        # data = yaml.safe_load("in.yaml")
+    return data

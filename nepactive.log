@@ -1,0 +1,4 @@
+2025-03-03 10:40:36,855 - nepactive - [train.py:run - 105 ] - INFO 
+ Initializing engine and make initial training data using ase
+2025-03-03 10:40:36,943 - nepactive - [train.py:make_init_ase_run - 166 ] - ERROR 
+ Process failed. Check the log at: /workplace/liuzf/code/nepactive/nepactive/init/task.000000/log
