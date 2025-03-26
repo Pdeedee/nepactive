@@ -1,0 +1,13 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/workplace/liuzf/code/nepactive/nepactive/main.py",
+            "console": "integratedTerminal",
+            "cwd": "/workplace/liuzf/code/nepactive/example/00.HMX"
+        }
+    ]
+}

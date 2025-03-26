@@ -1,6 +1,7 @@
 from nepactive import dlog,parse_yaml
 from nepactive.train import Nepactive
 from nepactive.remote import Remotetask
+from nepactive.stable import StableRun
 import logging
 import argparse
 import yaml
@@ -13,12 +14,19 @@ import yaml
 def _main():
     parser = argparse.ArgumentParser(description="nepactive")
     parser.add_argument("--remote", action="store_true", default=None, help="remote run")
+    parser.add_argument("--stable", action="store_true", default=None, help="remote run")
     args = parser.parse_args()  # 解析命令行输入并获取参数
     idata:dict = parse_yaml("in.yaml")
     
     if args.remote:
         task = Remotetask(idata=idata)
         task.run_submission()
+    if args.stable:
+        task = StableRun(idata=idata.get("stable"))
+        if not task:
+            dlog.error("no stable task infomation found in the in.yaml")
+            raise ValueError("no stable task infomation found in the in.yaml")
+        task.run()
     else:
         task = Nepactive(idata=idata)
         task.run()

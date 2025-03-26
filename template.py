@@ -1,5 +1,6 @@
 
 msst_template = """
+replicate       {replicate_cell}
 potential		nep.txt
 
 minimize sd 1.0e-6 1000
@@ -9,17 +10,18 @@ velocity		300
 
 ensemble        nvt_ber 300 300 200 # 0 0 0 10 0 0 258 258 258 77.5 77.5 253 1000
 
-# dump_thermo		{dump_freq}
-
+dump_thermo		{dump_freq}
+dump_exyz       {dump_freq} 
 run			    20000
 
 dump_thermo		{dump_freq}
 dump_exyz       {dump_freq}
-ensemble msst x {v_shock} qmass {qmass} mu {viscosity} tscale 0.01
+ensemble msst {shock_direction} {v_shock} qmass {qmass} mu {viscosity} tscale 0.01
 run                         {run_steps}
 """
 
 nvt_template = """
+replicate       {replicate_cell}
 potential		nep.txt
 minimize sd 1.0e-6 1000
 
@@ -48,6 +50,7 @@ run			    {run_steps}
 """
 
 nphugo_template = """
+replicate       {replicate_cell}
 potential		nep.txt
 minimize sd 1.0e-6 1000
 
@@ -78,7 +81,7 @@ gpumd > log 2>&1
 """
 
 nep_in_template ="""
-type 4 H C N O
+{nep_in_header}
 version       4       # default
 cutoff        5 4     # default
 n_max         4 4     # default
@@ -90,6 +93,6 @@ lambda_f      1.0     # default
 lambda_v      0.1     # default
 batch         1000     # default
 population    50      # default
-generation    10000  # default
+generation    {train_steps}  # default
  
 """

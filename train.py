@@ -23,9 +23,16 @@ from torch.cuda import empty_cache
 import itertools
 from concurrent.futures import ThreadPoolExecutor
 import re
-from nepactive.template import npt_template,nphugo_template,nvt_template,msst_template,model_devi_template
-from nepactive.gpumd_plt import gpumdplt
+from nepactive.template import npt_template,nphugo_template,nvt_template,msst_template,model_devi_template,nep_in_template
+from nepactive.plt import gpumdplt,nep_plt
 from nepactive import parse_yaml
+from nepactive.force import force_main
+# from numba import jit
+
+class RestartSignal(Exception):
+    def __init__(self, restart_total_time = None):
+        super().__init__()
+        self.restart_total_time = restart_total_time
 
 def process_id(value):
     # 检查是否为单一数字
@@ -49,36 +56,35 @@ def get_shortest_distance(atoms:Atoms,atom_index=None):
         atom_index.append(min_index)
     return np.min(distance_matrix)
 
+def traj_write(atoms_list:Atoms, calculator):
+    traj = Trajectory("out.traj", "w")
+    for atoms in atoms_list:
+        atoms._calc = calculator
+        atoms.get_potential_energy()
+        traj.write(atoms)    
+
 def get_force(atoms:Atoms,calculator):
     atoms._calc=calculator
     return atoms.get_forces(),atoms.get_potential_energy()
 
 def compute_volume_from_thermo(thermo:np.ndarray):
     num_columns = thermo.shape[1]
-    # dlog.info(f"thermo file has {num_columns} columns")
-    volume:np.ndarray
     if num_columns == 12:
-        box_length_x = thermo[:, 9]
-        box_length_y = thermo[:, 10]
-        box_length_z = thermo[:, 11]
-        volume = np.abs(box_length_x * box_length_y * box_length_z)
-        thermo = np.insert(thermo, 12, volume, axis=1)[:,[0,1,2,3,12]]
+        # 向量化计算
+        volume = np.abs(np.prod(thermo[:, 9:12], axis=1))
+        return np.column_stack((thermo[:, [0,1,2,3]], volume))
     elif num_columns == 18:
-        ax, ay, az = thermo[:, 9], thermo[:, 10], thermo[:, 11]
-        bx, by, bz = thermo[:, 12], thermo[:, 13], thermo[:, 14]
-        cx, cy, cz = thermo[:, 15], thermo[:, 16], thermo[:, 17]
-        # 计算晶胞的体积（使用行列式公式）
-        # 叉积 (b x c)
-        bx_cy_bz = by * cz - bz * cy
-        bx_cz_by = bz * cx - bx * cz
-        bx_cx_by = bx * cy - by * cx
-        # 点积 a · (b x c)
-        volume = ax * bx_cy_bz + ay * bx_cz_by + az * bx_cx_by
-        volume = np.abs(volume)  # 体积取绝对值
-        thermo = np.insert(thermo, 18, volume, axis=1)[:,[0,1,2,3,18]]
+        # 向量化计算叉积和点积
+        a = thermo[:, 9:12]
+        b = thermo[:, 12:15]
+        c = thermo[:, 15:18]
+        # 计算 b × c
+        cross = np.cross(b, c)
+        # 计算 a · (b × c)
+        volume = np.abs(np.sum(a * cross, axis=1))
+        return np.column_stack((thermo[:, [0,1,2,3]], volume))
     else:
         raise ValueError("thermo file has wrong format")
-    return thermo
 
 # task = None
 Maxlength = 70
@@ -98,6 +104,7 @@ class Nepactive(object):
         self.idata:dict = idata
         self.work_dir = os.getcwd()
         self.make_gpumd_task_first = True
+        self.gpu_available = self.idata.get("gpu_available")
 
     def run(self):
         '''
@@ -259,9 +266,12 @@ class Nepactive(object):
                     iter_rec = [int(x) for x in line.split()]
         cont = True
         self.ii = -1
-        numb_task = 6
+        numb_task = 9
         max_tasks = 10000
-        while cont:
+        self.restart_total_time = None
+
+        while True:
+            # if not self.restart_gpumd:
             self.ii += 1
             if self.ii < iter_rec[0]:
                 continue
@@ -271,92 +281,78 @@ class Nepactive(object):
             iter_name = f"iter.{self.ii:06d}"
             # iter_name = make_iter_name(ii)
             # sepline(iter_name, "=")
-            for jj in range(numb_task):
-                self.jj = jj
-                yaml_synchro = self.idata.get("yaml_synchro", False)
-                if yaml_synchro:
-                    dlog.info(f"yaml_synchro is True, reread the in.yaml from {self.work_dir}/in.yaml")
-                    self.idata:dict = parse_yaml(f"{self.work_dir}/in.yaml")
-                if self.ii * max_tasks + jj <= iter_rec[0] * max_tasks + iter_rec[1]:
-                    continue
-                task_name = "task %02d" % jj
-                sepline(f"{iter_name} {task_name}", "-")
-                if jj == 0:
-                    # log_iter("make_train", ii, jj)
-                    self.make_nep_train()
-                elif jj == 1:
-                    cont = self.make_model_devi()
-                elif jj == 2:
-                    dlog.info(f"start the {self.ii}th gpumd task")
-                    self.run_gpumd_task()
-                    dlog.info(f"finish the {self.ii}th gpumd task")
-                elif jj == 3:
-                    self.post_gpumd_run()
-                elif jj == 4:
-                    self.make_label_task()
-                elif jj == 5:
-                    self.run_label_task()
-                else:
-                    raise RuntimeError("unknown task %d, something wrong" % jj)
-                
-                os.chdir(self.work_dir)
-                record_iter(record, self.ii, jj)
+            self.restart_gpumd = False
 
-    def make_nep_train(self):
+            for jj in range(numb_task):
+                try:
+                    if not self.restart_gpumd:
+                        self.jj = jj
+                    yaml_synchro = self.idata.get("yaml_synchro", False)
+                    if yaml_synchro:
+                        dlog.info(f"yaml_synchro is True, reread the in.yaml from {self.work_dir}/in.yaml")
+                        self.idata:dict = parse_yaml(f"{self.work_dir}/in.yaml")
+                    if self.ii * max_tasks + jj <= iter_rec[0] * max_tasks + iter_rec[1] and not self.restart_gpumd:
+                        continue
+                    task_name = "task %02d" % jj
+                    sepline(f"{iter_name} {task_name}", "-")
+                    if jj == 0:
+                        # log_iter("make_train", ii, jj)
+                        self.make_nep_train()
+                    elif jj == 1:
+                        self.run_nep_train()
+                    elif jj == 2:
+                        self.post_nep_train()
+                    elif jj == 3:
+                        self.make_model_devi()
+                    #报错会进入except分支，正常执行完之后进入for循环
+                        # self.restart_gpumd = False
+                    elif jj == 4:
+                        self.run_model_devi()
+                    elif jj == 5:
+                        self.post_gpumd_run()
+                    elif jj == 6:
+                        self.make_label_task()
+                    elif jj == 7:
+                        self.run_label_task()
+                    elif jj == 8:
+                        # pass
+                        self.post_label_task()
+                    else:
+                        raise RuntimeError("unknown task %d, something wrong" % jj)
+                    os.chdir(self.work_dir)
+                    record_iter(record, self.ii, jj)
+                except RestartSignal as e:
+                    self.jj = 3
+                    self.restart_gpumd = True
+                    iter_rec = [self.ii,3]
+                    self.restart_total_time = e.restart_total_time
+                    while self.restart_gpumd:
+                        try:
+                            self.make_model_devi()
+                            self.run_model_devi()
+                            self.post_gpumd_run()
+                            # 报错后，以下两行代码不会执行
+                            self.restart_gpumd = False
+                            self.restart_total_time = None
+                        except RestartSignal as e1:
+                            self.restart_gpumd = True
+                            self.restart_total_time = e1.restart_total_time
+
+
+    def run_nep_train(self):
         '''
-        Train nep. 
+        run nep training
         '''
-        #ensure the work_dir is the absolute pathk
-        global_work_dir = os.path.abspath(self.work_dir)
+        train_steps = self.idata.get("train_steps", 7000)
         work_dir = os.path.abspath(os.path.join(self.iter_dir, "00.nep"))
         pot_num = self.idata.get("pot_num", 4)
-        init:bool = self.idata.get("init", True)
         pot_inherit:bool = self.idata.get("pot_inherit", True)
-        nep_template = os.path.abspath(self.idata.get("nep_template"))
-        os.makedirs(work_dir, exist_ok=True)
-        os.chdir(work_dir)
-        #     absworkdir/iter.000000/00.nep/
+        # nep_template = os.path.abspath(self.idata.get("nep_template"))
         processes = []
-
-        #preparation files
-        if pot_num > 4:
-            raise ValueError(f"pot_num should be no bigger than 4, and it is now {pot_num}")
-        
-        #make training data preparation
-        os.makedirs("dataset", exist_ok=True)
-        def merge_files(input_files, output_file):
-            command = ['cat'] + input_files  # 适用于类Unix系统
-            with open(output_file, 'wb') as outfile:
-                subprocess.run(command, stdout=outfile)
-        files = []
-        testfiles = []
-        # 注意每一代有没有划分训练集和测试集
-        if init == True:
-            print(f"{os.path.isfile(os.path.join(global_work_dir, 'init/train.xyz'))}")
-            # 直接调用 extend 方法，不要尝试将其结果赋值
-            files.extend(glob(os.path.join(global_work_dir, "init/train.xyz")))
-            testfiles.extend(glob(os.path.join(global_work_dir, "init/test.xyz")))
-
-            # 检查文件列表是否为空
-            if not files:
-                raise ValueError("No files found to merge.")
-        """等于之后反而出错了"""
-
-        if self.ii > 0:
-            for iii in range(self.ii):
-                newtrainfile = glob(f"../../iter.{iii:06d}/02.label/iter_train.xyz")
-                files.extend(newtrainfile)
-                newtestfile = glob(f"../../iter.{iii:06d}/02.label/iter_test.xyz")
-                testfiles.extend(newtestfile)
-                if (not newtrainfile) or (not newtestfile):
-                    dlog.warning(f"iter.{iii:06d} has no training or test data")
-        if not files:
-            raise ValueError("No files found to merge.")
-            # dlog.error("No files found to merge.")
-        merge_files(files, "dataset/train.xyz")
-        merge_files(testfiles, "dataset/test.xyz")
-        self.gpu_available = self.idata.get("gpu_available")
-
+        if not pot_inherit:
+            dlog.info(f"{os.getcwd()}")
+            dlog.info(f"pot_inherit is false, will remove old task files {work_dir}/task*")
+            os.system(f"rm -r {work_dir}/task.*")
         for jj in range(pot_num):
             #ensure the work_dir is the absolute path
             task_dir = os.path.join(work_dir, f"task.{jj:06d}")
@@ -369,13 +365,21 @@ class Nepactive(object):
             if not os.path.isfile("test.xyz"):
                 os.symlink("../dataset/test.xyz","test.xyz")
             if not os.path.isfile("nep.in"):
-                os.symlink(nep_template, "nep.in")
+                nep_in_header = self.idata.get("nep_in_header", "type 4 H C N O")
+                if self.ii == 0:
+                    ini_train_steps = self.idata.get("ini_train_steps", 40000)
+                    nep_in = nep_in_template.format(train_steps=ini_train_steps,nep_in_header=nep_in_header)
+                else:
+                    nep_in = nep_in_template.format(train_steps=train_steps,nep_in_header=nep_in_header)
+                with open("nep.in", "w") as f:
+                    f.write(nep_in)
+                # os.symlink(nep_template, "nep.in")
             if pot_inherit and self.ii > 0:
                 nep_restart = f"{self.work_dir}/iter.{self.ii-1:06d}/00.nep/task.{jj:06d}/nep.restart"
                 dlog.info(f"pot_inherit is true, will copy nep.restart from {nep_restart}")
                 shutil.copy(nep_restart, "nep.restart")
                 # exit()
-            log_file = os.path.join(task_dir, 'subprocess_log.txt')  # Log file path
+            log_file = os.path.join(task_dir, 'log')  # Log file path
             env = os.environ.copy()
             gpu_id = self.gpu_available[jj%len(self.gpu_available)]
             env['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
@@ -401,112 +405,219 @@ class Nepactive(object):
                     else:
                         dlog.info(f"Process completed successfully. Log saved at: {log_file}")
 
+    def post_label_task(self):
+        '''
+        '''
+        pass
+
+    def post_nep_train(self):
+        '''
+        post nep training
+        '''
+        os.chdir(f"{self.work_dir}/iter.{self.ii:06d}/00.nep")
+        tasks = glob("task.*")
+        nep_plot = self.idata.get("nep_plot", True)
+        for task in tasks:
+            if nep_plot:
+                os.chdir(f"{self.work_dir}/iter.{self.ii:06d}/00.nep")
+                os.chdir(task)
+                nep_plt()
+                nep_plt(testplt=False)
+
+    def make_nep_train(self):
+        '''
+        Train nep. 
+        '''
+        #ensure the work_dir is the absolute pathk
+        global_work_dir = os.path.abspath(self.work_dir)
+        work_dir = os.path.abspath(os.path.join(self.iter_dir, "00.nep"))
+        pot_num = self.idata.get("pot_num", 4)
+        init:bool = self.idata.get("init", True)
+
+        os.makedirs(work_dir, exist_ok=True)
+        os.chdir(work_dir)
+        #     absworkdir/iter.000000/00.nep/
+
+
+        #preparation files
+        if pot_num > 4:
+            raise ValueError(f"pot_num should be no bigger than 4, and it is now {pot_num}")
+        
+        #make training data preparation
+        os.makedirs("dataset", exist_ok=True)
+        def merge_files(input_files, output_file):
+            command = ['cat'] + input_files  # 适用于类Unix系统
+            with open(output_file, 'wb') as outfile:
+                subprocess.run(command, stdout=outfile)
+        files = []
+        testfiles = []
+        # 注意每一代有没有划分训练集和测试集
+        if init == True:
+            print(f"{os.path.isfile(os.path.join(global_work_dir, 'init/train.xyz'))}")
+            # 直接调用 extend 方法，不要尝试将其结果赋值
+            files.extend(glob(os.path.join(global_work_dir, "init/train.xyz")))
+            testfiles.extend(glob(os.path.join(global_work_dir, "init/test.xyz")))
+
+            # 检查文件列表是否为空
+            # if not files:
+            #     raise ValueError("No files found to merge.")
+        """等于之后反而出错了"""
+
+        if self.ii > 0:
+            for iii in range(self.ii):
+                newtrainfile = glob(f"../../iter.{iii:06d}/02.label/iter_train.xyz")
+                files.extend(newtrainfile)
+                newtestfile = glob(f"../../iter.{iii:06d}/02.label/iter_test.xyz")
+                testfiles.extend(newtestfile)
+                if (not newtrainfile) or (not newtestfile):
+                    dlog.warning(f"iter.{iii:06d} has no training or test data")
+        if not files:
+            raise ValueError("No files found to merge.")
+            # dlog.error("No files found to merge.")
+        merge_files(files, "dataset/train.xyz")
+        merge_files(testfiles, "dataset/test.xyz")
+        self.gpu_available = self.idata.get("gpu_available")
+
+
+
         # work_dir = os.path.abspath(f"{work_dir}/task.{ii:06d}")
 
     def make_model_devi(self):
         '''
         run gpumd, this function is referenced by make_loop_train
         '''
-        # model_devi_jobs = idata["model_devi"]
-        model_devi_general:list[dict] = self.idata.get("model_devi_general", None)
-        # if self.make_gpumd_task_first:
-        #     dlog.info(f"make_gpumd_task_first is true, will remove old task files {self.work_dir}/iter.{iter_index:06d}/01.gpumd/task*")
-        #     os.system(f"rm -r {self.work_dir}/iter.{iter_index:06d}/01.gpumd/task*")
-        dlog.info(f"model_devi_general:{model_devi_general}")
 
         model_devi = self.get_model_devi()
-
-
         iter_index = self.ii
-        # os.chdir(f"")
+
+
         if self.make_gpumd_task_first:
-            dlog.info(f"make_gpumd_task_first is true, will remove old task files {self.work_dir}/iter.{iter_index:06d}/01.gpumd/task*")
-            os.system(f"rm -r {self.work_dir}/iter.{iter_index:06d}/01.gpumd/task*")
-        # dlog.info(f"model_devi:{model_devi}")
+            # 日志记录
+            dlog.info(f"make_gpumd_task_first is true, will backup old task directory {self.work_dir}/iter.{iter_index:06d}/01.gpumd")
+
+            # 查找已有的备份文件夹
+            bak_files = glob(f"{self.work_dir}/iter.{iter_index:06d}/01.gpumd.bak.*")
+            if bak_files:
+                # 提取最大后缀数字
+                suffixes = [int(os.path.basename(f).split('.')[-1]) for f in bak_files]
+                new_suffix = max(suffixes) + 1
+            else:
+                # 如果没有备份文件夹，默认后缀为 0
+                new_suffix = 0
+
+            # 构造新备份路径
+            src_dir = f"{self.work_dir}/iter.{iter_index:06d}/01.gpumd"
+            dst_dir = f"{self.work_dir}/iter.{iter_index:06d}/01.gpumd.bak.{new_suffix}"
+
+            # 重命名文件夹
+            if os.path.exists(src_dir):
+                shutil.move(src_dir, dst_dir)
+                dlog.info(f"Backup completed: {src_dir} -> {dst_dir}")
+            else:
+                dlog.warning(f"Source directory does not exist: {src_dir}")
+
+
         work_dir = f"{self.work_dir}/iter.{self.ii:06d}/01.gpumd"
-        self.make_gpumd_task(model_devi=model_devi,work_dir=work_dir)
-
-
-    def make_gpumd_task(self,model_devi:dict,work_dir:str=None):
-        if not work_dir:
-            work_dir = os.getcwd()
-        if not model_devi:
-            model_devi = self.idata
-        all_dict = {}
-        ensemble = model_devi.get("ensemble")[0]
-        structure_id = model_devi.get("structure_id")
         structure_files:list = self.idata.get("structure_files")
         structure_prefix = self.idata.get("structure_prefix")
-        structure_files = [os.path.join(structure_prefix,structure_file) for structure_file in structure_files]
-        assert structure_files is not None
-        # dump_freq = model_devi.get("dump_freq")
-        # if not dump_freq:
-        #     dump_freq = self.idata.get("dump_freq")
-        structure = [structure_files[ii] for ii in structure_id] #####################################################
-        all_dict["structure"] = structure
         time_step_general = self.idata.get("model_devi_time_step", None)
-        time_step = model_devi.get("time_step")
-        run_steps = model_devi.get("run_steps",20000)
-        if not time_step:
-            time_step = time_step_general
-        assert all([structure,time_step,run_steps]), "有变量为空"
-        # task_dict = {}
-        task_dicts = []
-        if ensemble in ["nvt", "npt", "nphugo"]:
-            temperature = model_devi.get("temperature") #
-            if ensemble in ["npt", "nvt"]:
-                assert temperature is not None
-                all_dict["temperature"] = temperature
-            if ensemble in ["npt", "nphugo"]:
-                pressure = model_devi.get("pressure") #
-                all_dict["pressure"] = pressure
-                assert pressure is not None
-            if ensemble == "nphugo":
-                e0 = model_devi.get("e0")
-                p0 = model_devi.get("p0")
-                v0 = model_devi.get("v0")
-                all_dict["e0"] = e0
-                all_dict["p0"] = p0
-                all_dict["v0"] = v0
-        elif ensemble == "msst":
-            v_shock:list = model_devi.get("v_shock",[9.0])       #
-            qmass:list = model_devi.get("qmass",[100000])           #
-            viscosity:list = model_devi.get("viscosity",[10])   #
-            all_dict["v_shock"] = v_shock
-            all_dict["qmass"] = qmass
-            all_dict["viscosity"] = viscosity
-        else:
-            raise NotImplementedError
-        dlog.info(f"all_dict:{all_dict}")
-        assert all(v not in [None, '', [], {}, set()] for v in all_dict.values())
-        # task_para = []
-        # combo_numbers = 0
-        for combo in itertools.product(*all_dict.values()):
-            # 将每一组合生成字典，字典的键是列表的变量名，值是组合中的对应元素
-            combo_dict = {keys: combo[index] for index, keys in enumerate(all_dict.keys())}
-            task_dicts.append(combo_dict)
-        dlog.info(f"{all_dict.keys()} generate {len(task_dicts)} tasks")
-        self.needed_frames = self.idata.get("needed_frames",10000)
-        self.frames_pertask = self.needed_frames/len(task_dicts)
-        self.dump_freq = max(1,floor(run_steps/self.frames_pertask))
-        dump_freq = self.dump_freq
-        self.model_devi_task_numbers = len(task_dicts)
+        structure_files = [os.path.join(structure_prefix,structure_file) for structure_file in structure_files]
         nep_file = self.idata.get("nep_file","../../00.nep/task.000000/nep.txt")
-        for index,task in enumerate(task_dicts):
+        needed_frames = self.idata.get("needed_frames",10000)
+        self.total_time, self.model_devi_task_numbers = Nepactive.make_gpumd_task(model_devi=model_devi, structure_files=structure_files, needed_frames=needed_frames,
+                                                                                 time_step_general=time_step_general, work_dir=work_dir,nep_file=nep_file, restart_total_time = self.restart_total_time)
+
+    @classmethod
+    def make_gpumd_task(cls, model_devi:dict, structure_files, needed_frames=10000, time_step_general=0.2, work_dir:str=None, nep_file:str=None, restart_total_time:float=None):
+        if not work_dir:
+            work_dir = os.getcwd()
+        if not nep_file:
+            nep_file = f"{work_dir}/nep.txt"
+        # if not model_devi:
+        #     model_devi = self.idata
+        task_dicts = []
+        ensembles = model_devi.get("ensembles")
+        for ensemble_index,ensemble in enumerate(ensembles):
+            structure_id = model_devi.get("structure_id")[ensemble_index]
+            all_dict = {}
+            assert structure_files is not None
+            structure = [structure_files[ii] for ii in structure_id] #####################################################
+            all_dict["structure"] = structure
+            # time_step_general = self.idata.get("model_devi_time_step", None)
+            time_step = model_devi.get("time_step")
+            run_steps = model_devi.get("run_steps",20000)
+            if not time_step:
+                time_step = time_step_general
+
+            if restart_total_time:
+                run_steps = int(restart_total_time/time_step)
+                dlog.warning(f"restart_total_time is {restart_total_time}, run_steps is reset to {run_steps}")
+
+            assert all([structure,time_step,run_steps]), "有变量为空"
+            # task_dict = {}
+
+            if ensemble in ["nvt", "npt", "nphugo"]:
+                temperature = model_devi.get("temperature") #
+                if ensemble in ["npt", "nvt"]:
+                    assert temperature is not None
+                    all_dict["temperature"] = temperature
+                if ensemble in ["npt", "nphugo"]:
+                    pressure = model_devi.get("pressure") #
+                    all_dict["pressure"] = pressure
+                    assert pressure is not None
+                if ensemble == "nphugo":
+                    e0 = model_devi.get("e0")
+                    p0 = model_devi.get("p0")
+                    v0 = model_devi.get("v0")
+                    all_dict["e0"] = e0
+                    all_dict["p0"] = p0
+                    all_dict["v0"] = v0
+            elif ensemble == "msst":
+                v_shock:list = model_devi.get("v_shock",[9.0])       #
+                qmass:list = model_devi.get("qmass",[100000])           #
+                viscosity:list = model_devi.get("viscosity",[10])   #
+                shock_direction = model_devi.get("shock_direction","x")
+                all_dict["v_shock"] = v_shock
+                all_dict["qmass"] = qmass
+                all_dict["viscosity"] = viscosity
+                all_dict["shock_direction"] = shock_direction
+            else:
+                raise NotImplementedError
+            dlog.info(f"all_dict:{all_dict}")
+            assert all(v not in [None, '', [], {}, set()] for v in all_dict.values())
+            # task_para = []
+            # combo_numbers = 0
+            for combo in itertools.product(*all_dict.values()):
+                # 将每一组合生成字典，字典的键是列表的变量名，值是组合中的对应元素
+                combo_dict = {keys: combo[index] for index, keys in enumerate(all_dict.keys())}
+                task_dicts.append((ensemble,combo_dict))
+            dlog.info(f"{all_dict.keys()} generate {len(task_dicts)} tasks")
+            frames_pertask = needed_frames/len(task_dicts)
+            dump_freq = max(1,floor(run_steps/frames_pertask))
+            # dump_freq = dump_freq
+            model_devi_task_numbers = len(task_dicts)
+            replicate_cell = model_devi.get("replicate_cell","1 1 1")
+            # nep_file = self.idata.get("nep_file","../../00.nep/task.000000/nep.txt")
+        # dlog.info(f"task_dicts:{task_dicts}")
+        index = 0
+        for ensemble,task in task_dicts:
             if ensemble == "msst":
-                text = msst_template.format(time_step = time_step,run_steps = run_steps,dump_freq = dump_freq, **task)
+                assert run_steps > 20000
+                text = msst_template.format(time_step = time_step,run_steps = run_steps-20000,dump_freq = dump_freq, replicate_cell = replicate_cell, **task)
             elif ensemble == "nvt":
-                text = nvt_template.format(time_step = time_step,run_steps = run_steps,dump_freq = dump_freq, **task)
+                text = nvt_template.format(time_step = time_step,run_steps = run_steps,dump_freq = dump_freq, replicate_cell = replicate_cell, **task)
             elif ensemble == "npt":
-                text = npt_template.format(time_step = time_step,run_steps = run_steps,dump_freq = dump_freq, **task)
+                text = npt_template.format(time_step = time_step,run_steps = run_steps,dump_freq = dump_freq, replicate_cell = replicate_cell, **task)
             elif ensemble == "nphugo":
                 assert run_steps > 20000
                 text = nphugo_template.format(
                     time_step = time_step,
                     run_steps = run_steps-20000,
                     dump_freq = dump_freq,
+                    replicate_cell = replicate_cell,
                     **task
                 )
+                # dlog.info(f"nphugo task:{task},npugo text:{text}")
             else:
                 raise NotImplementedError(f"The ensemble {ensemble} is not supported")
             task_dir = f"{work_dir}/task.{index:06d}"
@@ -525,10 +636,13 @@ class Nepactive(object):
                 f.write(text)
             if not os.path.isfile("nep.txt"):
                 os.symlink(nep_file, "nep.txt")
-                
-        # dlog.info("generate gpumd task done")
+            index += 1
+        total_time = run_steps*time_step
 
-    def run_gpumd_task(self):
+        # dlog.info("generate gpumd task done")
+        return total_time, model_devi_task_numbers
+
+    def run_model_devi(self):
         # dlog.info("entering the run_gpumd_task")
         try:
             self.dump_freq
@@ -540,23 +654,34 @@ class Nepactive(object):
             dlog.info("remake the gpumd task")
         model_devi_dir = f"{self.work_dir}/iter.{self.ii:06d}/01.gpumd"
         os.chdir(model_devi_dir)
-        tasks = glob("task.*")
-        # tasks = glob("task.*")
-        if not tasks:
-            raise RuntimeError(f"No task files found in {model_devi_dir}")
-        
         gpu_available = self.idata.get("gpu_available")
         self.task_per_gpu = self.idata.get("task_per_gpu")
-        parallel_process = self.task_per_gpu * len(gpu_available)
-        interval = ceil(len(tasks)/parallel_process)
-        jobs = [tasks[i:i + interval] for i in range(0, len(tasks), interval) if tasks[i:i + interval]]
+
+
+        Nepactive.run_gpumd_task(work_dir=model_devi_dir, gpu_available=gpu_available, task_per_gpu=self.task_per_gpu)
+
+    @classmethod
+    def run_gpumd_task(cls,work_dir:str=None,gpu_available:List[int]=None,task_per_gpu:int=1):
+        tasks = glob("task.*")
+        if not work_dir:
+            work_dir = os.getcwd()
+        # tasks = glob("task.*")
+        if not tasks:
+            raise RuntimeError(f"No task files found in {work_dir}")
+        
+        # parallel_process = task_per_gpu * len(gpu_available)
+        # interval = ceil(len(tasks)/parallel_process)
+        task_per_job = task_per_gpu * len(gpu_available)
+        jobs = []
+        for job_id in range(task_per_job):
+            jobs.append([tasks[i] for i in range(0, len(tasks)) if (i % task_per_job) == job_id])
         job_list = []
         for index,job in enumerate(jobs):
             # text = ""
             # for task in job:
             #     text += model_devi_template.format(work_dir = f"{self.work_dir}/iter.{self.ii:06d}/01.gpumd",
             #                                       task_dir = task)
-            text = "".join([model_devi_template.format(work_dir=f"{self.work_dir}/iter.{self.ii:06d}/01.gpumd", task_dir=task) for task in job])
+            text = "".join([model_devi_template.format(work_dir=work_dir, task_dir=task) for task in job])
             with open(f"job_{index:03d}.sub", 'w') as f:
                 f.write(text)
             job_list.append(f"job_{index:03d}.sub")
@@ -567,7 +692,7 @@ class Nepactive(object):
             # os.chdir(f"{model_devi_dir}/{task}")    
             log_file = f"job_{index:03d}.log"  # Log file path
             env = os.environ.copy()
-            gpu_id = gpu_available[ceil(index/self.task_per_gpu)]
+            gpu_id = gpu_available[index%len(gpu_available)]
             env['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
             with open(log_file, 'w') as log:
                 process = subprocess.Popen(
@@ -584,39 +709,32 @@ class Nepactive(object):
             # Check for errors using the return code
             if process.returncode != 0:
                 dlog.error(f"Process failed. Check the log at: {log_file}")
-                raise RuntimeError(f"One or more processes failed. Check the log ({log_file}) files for details.")
+                raise RuntimeError(f"One or more processes failed. Check the log ({work_dir}/{log_file}) files for details.")
             else: 
-                dlog.info(f"gpumd run successfully. Log saved at: {log_file}")
-
-                plot = self.idata.get("gpumd_plt",True)
-
-        if plot:
-            model_devi_dir = f"{self.work_dir}/iter.{self.ii:06d}/01.gpumd"
-            os.chdir(model_devi_dir)
-            task_dirs = [os.path.join(model_devi_dir,task) for task in glob("task*")]
-            dlog.info(f"plotting {len(task_dirs)} tasks")
-            for task_dir in task_dirs:
-                #ensure the work_dir is the absolute path
-                os.chdir(task_dir)
-                self.time_step = self.idata.get("time_step")
-                gpumdplt(self.dump_freq,self.time_step)
+                dlog.info(f"gpumd run successfully. Log saved at: {work_dir}/{log_file}")
         
-    def get_model_devi(self):
+    def get_model_devi(self,iteration:int=None):
         '''
         get the model deviation from the gpumd run
         '''
-        model_devi_general = self.idata.get("model_devi_general", None)
+        # dlog.info(f"self.idata:{self.idata}")
+        model_devi_general:list[dict] = self.idata.get("model_devi_general", None)
+        dlog.info(f"model_devi_general:{model_devi_general}")
+        find_id = False
         run_steps_length = 0
+        if not iteration:
+            iteration = self.ii
+        # dlog.info(f"iteration:{iteration}")
         for ii, model_devi in enumerate(model_devi_general):
             model_devi_id = process_id(model_devi.get("id", None))
             each_run_steps = model_devi.get("each_run_steps", [0])
             now_run_steps_length = len(model_devi_id)
-            if self.ii in model_devi_id:
+            if iteration in model_devi_id:
                 find_id = True
                 model_devi = model_devi_general[ii]
-                runsteps_id =  self.ii - run_steps_length
+                runsteps_id =  iteration - run_steps_length
                 # dlog.info(f"runsteps_id:{runsteps_id},self.ii:{self.ii},run_steps_length:{run_steps_length}")
-                if runsteps_id < 0:
+                if runsteps_id < 0 or runsteps_id >= len(each_run_steps):
                     runsteps_id = -1
                     dlog.info("the each_runsteps is not enough, will use the last one")
                 model_devi["run_steps"] = each_run_steps[runsteps_id]
@@ -625,231 +743,178 @@ class Nepactive(object):
             run_steps_length += now_run_steps_length   #skip the run_steps_length
             
         if not find_id:
-            dlog.info(f"the ii:{self.ii} is not in model_devi_general, will use the last one")
-            dlog.warning(f"not finding the {self.ii}th task settings in model_devi_general, will end the job")
-            raise RuntimeError(f"not finding the {self.ii}th task settings in model_devi_general, will end the job")
+            dlog.info(f"the ii:{iteration} is not in model_devi_general, will use the last one")
+            dlog.error(f"not finding the {iteration}th task settings in model_devi_general, will end the job")
+            raise RuntimeError(f"not finding the {iteration}th task settings in model_devi_general, will end the job")
         return model_devi
-
-    
 
     def post_gpumd_run(self):
         '''
         extract the information from gpumd run, this function is referenced by make_loop_train
         '''
         try:
-            self.dump_freq
+            self.total_time
         except AttributeError:
             # 捕获变量不存在时的错误
             self.make_gpumd_task_first = False
             self.make_model_devi()
             self.make_gpumd_task_first = True
             dlog.info("remake the gpumd task")
-        iter_dir = self.iter_dir
+        nep_dir = os.path.join(self.iter_dir, "00.nep")
+        plot = self.idata.get("gpumd_plt",True)
+
+        if plot:
+            model_devi_dir = f"{self.work_dir}/iter.{self.ii:06d}/01.gpumd"
+            os.chdir(model_devi_dir)
+            task_dirs = [os.path.join(model_devi_dir,task) for task in glob("task*")]
+            # dlog.info(f"plotting {len(task_dirs)} tasks")
+            dlog.info(f"plotting {len(task_dirs)} tasks")
+            for task_dir in task_dirs:
+                #ensure the work_dir is the absolute path
+                os.chdir(task_dir)
+                self.time_step = self.idata.get("time_step")
+                try:
+                    gpumdplt(self.total_time,self.time_step)
+                except Exception as e:
+                    dlog.error(f"plotting {task_dir} failed, error message:{e}")
+                    raise RuntimeError(f"plotting {task_dir} failed, error message:{e}")
+                    # continue
+        # iter_dir = self.iter_dir
         gpumd_dir = os.path.join(self.iter_dir, "01.gpumd")
         os.chdir(gpumd_dir)
-        subprocess.run(["cat */dump.xyz > all.xyz"], shell = True, capture_output = True, text=True)
+
+        # subprocess.run(["cat */dump.xyz > all.xyz"], shell = True, capture_output = True, text=True)
         # subprocess.run(["cat */thermo.out > thermo.out"], shell = True, capture_output = True, text=True)
         dlog.info("-----start analysis the trajectory-----")
-        atoms = read("all.xyz", index=":", format="extxyz")
-        dlog.info(f"Totally {len(atoms)} structures.")
+        # atoms = read("all.xyz", index=":", format="extxyz")
+        # dlog.info(f"Totally {len(atoms)} structures.")
         model_devi:dict = self.get_model_devi()
-        max_candidate = model_devi.get("max_candidate")
-        continue_from_old = self.idata.get("continue_from_old", False)
+        max_candidate = model_devi.get("max_candidate",None)
         if not max_candidate:
-            max_candidate = self.idata.get("max_candidate")
-        #检查效率，是重新复制粘贴快，不爆炸显存的话应该复制粘贴快吧
-        if len(atoms) > max_candidate*2:
-            random_indices = random.sample(range(len(atoms)),max_candidate*2)
-        else:
-            random_indices = range(len(atoms))
-
-        # if len(atoms) > 200:
-        #     random_indices = random.sample(range(len(atoms)),200)
-        # else:
-        #     random_indices = range(len(atoms))
-        dlog.info(f"extract {len(random_indices)} structures.")
-
-        assert(os.path.isabs(iter_dir))
-
-        nep_dir = os.path.join(self.iter_dir, "00.nep")
-        level = self.idata.get("uncertainty_level", 1)
-        threshold = self.idata.get("uncertainty_threshold", [0.2,0.5])
+            max_candidate = self.idata.get("max_candidate",10000)
+        continue_from_old = self.idata.get("continue_from_old", False)
+        # os.chdir(f"{self.}")
+        sample_method = self.idata.get("sample_method", "relative")
+        
+        threshold = model_devi.get("uncertainty_threshold",None)
+        if not threshold:
+            threshold = self.idata.get("threshold",[0.2,0.5])
         mode = self.idata.get("uncertainty_mode", "mean")
         energy_threshold = self.idata.get("energy_threshold", None)
-        uncertainty, frame_index= Nepactive.relative_force_error( atoms_list=atoms, nep_dir = nep_dir, selected_indices=random_indices, level = level, threshold = threshold, mode = mode, energy_threshold = energy_threshold)
-        # dlog.info(f"uncertainty:{uncertainty},frame_index:{frame_index}")
-
-        #剔除多余的candidate
-        original_failed_ratio = len(frame_index["failed"])/(len(random_indices))
-        if len(frame_index["candidate"]) > max_candidate:
-            candidate_indices = random.sample(frame_index["candidate"], max_candidate)
-            frame_index["candidate"] = candidate_indices
-            frame_index["failed"].extend([ii for ii in frame_index["candidate"] if ii not in candidate_indices])
-        accurate_ratio = len(frame_index["accurate"])/(len(random_indices))
-        dlog.info(f"accurate:{len(frame_index['accurate'])}, candidate:{len(frame_index['candidate'])}, failed:{len(frame_index['failed'])}, accurate_ratio:{accurate_ratio},original_failed:{original_failed_ratio}")
-
-
-        candidate_info = frame_index["candidate"]
-        uncertainty = [iterm[1] for iterm in candidate_info]
-        with open("frame_index.json", "w") as json_file:
-            json.dump(frame_index, json_file, indent=4)
-
-        index = [iterm[0] for iterm in candidate_info]
-        traj_selected = [atoms[i] for i in index]
-        shortest_distance = [get_shortest_distance(atom) for atom in traj_selected]
-
-        thermo_files = glob("*/thermo.out")
-        thermo_files.sort()
-        thermo_averages = []
-        for iter,thermo_file in enumerate(thermo_files):
-            dlog.info(f"processing thermo_file:{thermo_file}")
-            if iter == 0:
-                thermo = np.loadtxt(thermo_file)
-                thermo = compute_volume_from_thermo(thermo)
-                thermos = thermo
-                thermo_averages = thermo_average = np.average(thermo[int(0.2 * len(thermo)):int(0.9 * len(thermo))], axis=0)[np.newaxis, :]
+        level = self.idata.get("uncertainty_level", 1)
+        frame_properties = None
+        atom_lists = None
+        thermo_averages = None
+        dlog.info(f"-----start analysis the trajectory-----"
+                  f"threshold:{threshold},energy_threshold:{energy_threshold},mode:{mode},level:{level},sample_method:{sample_method}"
+                  f"continue_from_old:{continue_from_old},max_candidate:{max_candidate},uncertainty_threshold:{threshold}")
+        task_dirs.sort()
+        for ii,task_dir in enumerate(task_dirs):
+            os.chdir(task_dir)
+            dlog.info(f"processing task {ii}")
+            atoms_list, frame_property = Nepactive.relative_force_error(total_time=self.total_time, nep_dir=nep_dir, mode=mode,level=level)
+            #注意到使用到了vstack，因为concatenate无法改变数组维数
+            # thermo_average = np.average(thermo[int(0.2 * len(thermo)):int(0.9 * len(thermo))], axis=0)[np.newaxis, :]
+            thermo_average = np.average(frame_property[int(0.2 * len(frame_property)):int(0.9 * len(frame_property))],axis=0)[1:][np.newaxis,:]
+            if thermo_averages is None:
+                thermo_averages = thermo_average
             else:
-                thermo = np.loadtxt(thermo_file)
-                thermo = compute_volume_from_thermo(thermo)
-                thermos = np.concatenate((thermos,thermo),axis=0)
-                thermo_average = np.average(thermo[int(0.2 * len(thermo)):int(0.9 * len(thermo))], axis=0)[np.newaxis, :]
-                thermo_averages = np.concatenate((thermo_averages,thermo_average),axis=0)
+                thermo_averages = np.vstack((thermo_averages, thermo_average))  # 垂直堆叠
+            if atom_lists is None:
+                atom_lists = atoms_list
+            else:
+                atom_lists.extend(atoms_list)
+            if frame_properties is None:
+                frame_properties = frame_property
+            else:
+                frame_properties = np.concatenate((frame_properties,frame_property),axis=0)
+        os.chdir(gpumd_dir)
+        #利用不确定性和能量差距筛选
+        candidate_condition = (((frame_properties[:, 1] >= threshold[0]) & (frame_properties[:, 1] <= threshold[1]))  | (frame_properties[:, 2] > energy_threshold)) & (frame_properties[:,3] > 0.6)
+        candidate_indices = np.where(candidate_condition)[0]
+        filtered_rows = frame_properties[candidate_indices]
+        filtered_rows_with_indices = np.column_stack((candidate_indices, filtered_rows))
+        accurate_condition = (frame_properties[:, 1] < threshold[0]) & (frame_properties[:, 2] < energy_threshold)
+        accurate_ratio = len(np.where(accurate_condition)[0]) / len(frame_properties)
+        candidate_ratio = len(candidate_indices) / len(frame_properties)
+        failed_ratio = 1 - accurate_ratio - candidate_ratio
+        dlog.info(f"failed ratio: {failed_ratio}, candidate ratio: {candidate_ratio}, accurate ratio: {accurate_ratio}")
+        #原本是8列，添加indice是9列
 
-        property_needed = thermos[:,[0,3,4]]
-        property_needed = property_needed[index]
-        self.frames_pertask = len(thermos)/self.model_devi_task_numbers
-        property_needed = np.insert(property_needed, 0, index, axis=1)
-        property_needed = np.insert(property_needed, property_needed.shape[1], shortest_distance, axis=1)
-        property_needed = np.insert(property_needed, property_needed.shape[1], uncertainty, axis=1)
-        sorted_indices = np.argsort(property_needed[:, 0])
-        # 根据索引重新排序整个数组
-        property_needed = property_needed[sorted_indices]
-        property_needed[:,0] = property_needed[:,0]%self.frames_pertask
-        np.savetxt("candidate.txt",property_needed,fmt = "%12d %12.2f %12.2f %12.2f %12.2f %12.2f", header = "%11s %-14s %-14s %-14s %-14s %-14s"%("index", "temperature", "pressure", "volume", "shortest_distance", "uncertainty"))
+        if filtered_rows_with_indices.shape[0] > max_candidate:
+            sorted_rows = filtered_rows_with_indices[filtered_rows_with_indices[:, 2].argsort()[::-1]]
+            selected_rows = sorted_rows[:max_candidate]
+        else:
+            selected_rows = filtered_rows_with_indices
+
+        final_sorted_rows = selected_rows[selected_rows[:, 0].argsort()]
+        fmt = "%14d %12.2f %12.2f %12.2f %12.2f %12.2f %12.2f %12.2f %12.2f"
+        header = f"{'indices':>14} {'time':^14} {'relative_error':^14} {'energy_error':^14} {'shortest_d':^14} {'temperature':^14} {'potential':^14} {'pressure':^14} {'volume':^14}"
+        np.savetxt("candidate.txt", final_sorted_rows, fmt = fmt, header = header)
         with open(f'{self.work_dir}/thermo.txt', 'a') as f:
-            np.savetxt(f, thermo_averages, fmt='%24.2f %12.2f %12.2f %12.2f %12.2f', 
-                    header=" %14s %-14s %-14s %-14s %-14s" % ("temperature", "kinetic", "potential", "pressure", "volume"),
+            np.savetxt(f, thermo_averages, fmt="%24.2f %12.2f %12.2f %12.2f %12.2f %12.2f %12.2f", 
+                    header=f"{'relative_error':^14} {'energy_error':^14} {'shortest_d':^14} {'temperature':^14} {'potential':^14} {'pressure':^14} {'volume':^14}",
                     comments=f"#iter.{self.ii:06d}")
-        os.remove("all.xyz")
-        index.sort()
-        atoms = [atoms[i] for i in index]
-        label_dir = os.path.join(iter_dir, "02.label")
+        label_dir = os.path.join(self.iter_dir, "02.label")
+        # candidate_list = atom_lists[filtered_rows_with_indices[:, 0].astype(int)]
+        # indices = final_sorted_rows[:, 0].astype(int)
+        candidate_list = [atom_lists[i] for i in final_sorted_rows[:, 0].astype(int)]
         os.makedirs(label_dir, exist_ok=True)
-        write_extxyz(os.path.join(label_dir, "candidate.xyz"), atoms)
-        if len(frame_index["candidate"]) == 0:
-            # return True
-            dlog.warning("no candidate frames is selected")
-            
-            raise ValueError("there are no candidate frames, maybe you can change the ensemble file")
-        dlog.info("-----finish analysis the trajectory-----")
-
-        del atoms
-        empty_cache()
+        write_extxyz(os.path.join(label_dir, "candidate.xyz"), candidate_list)
 
     @classmethod
-    def relative_force_error(cls, atoms_list:List[Atoms], nep_dir = None, selected_indices=None, level = 1, threshold = [0.2, 0.5], mode:str = "mean" , energy_threshold = 1):
+    def relative_force_error(cls, total_time, nep_dir = None, mode:str = "mean", level = 1):
         """
-        return uncertanty list for selected_indices in atoms traj
         return frame_index dict for accurate, candidate, failed
         the candidate_index may be more than the needed, need to resample
         """
-        threshold_low = threshold[0]
-        threshold_high = threshold[1]
-        if not selected_indices:
-            selected_indices = range(len(atoms_list))
         if not nep_dir:
             nep_dir = os.getcwd()
         calculator_fs = glob(f"{nep_dir}/**/nep*.txt")
-        calculators = [NEP(calculator_fs[i]) for i in range(len(calculator_fs))]
-
-        frame_index={
-            "accurate":[],
-            "candidate":[],
-            "failed":[]
-        }
-        
-        candidate_but_failed_index = []
-        candidate_but_failed_atom_index = []
-        natoms = len(atoms_list[0])
-        
-        for ii in selected_indices:
-        # for ii in tqdm(random_indices):
-            forceslist = [get_force(atoms_list[ii],calculator) for calculator in calculators]
-            energy_list = [iterm[1] for iterm in forceslist]
-            forceslist = [iterm[0] for iterm in forceslist]
-            # exit()
-            avg_force = np.average(forceslist,axis=0)
-            deltaforcesquare = np.sqrt(np.mean(np.square([(forceslist[i] - avg_force) for i in range(len(forceslist))]).sum(axis=2),axis=0))
-            # 先计算绝对值再mean
-            absforce_avg = np.mean(np.sqrt(np.square(forceslist).sum(axis=2)),axis=0)
-            relative_error = (deltaforcesquare/(absforce_avg+level))
+        atoms_list = read(f"dump.xyz", index = ":")
+        f_lists = force_main(atoms_list, calculator_fs)
+        property_list = []
+        time_list = np.linspace(0, total_time, len(atoms_list), endpoint=False)/1000
+        for ii,atoms in tqdm(enumerate(atoms_list)):
+            f_list = [item[ii] for item in f_lists]
+            energy_list = [iterm[1] for iterm in f_list]
+            f_list = [iterm[0] for iterm in f_list]
+            f_avg = np.average(f_list,axis=0)
+            df_sqr = np.sqrt(np.mean(np.square([(f_list[i] - f_avg) for i in range(len(f_list))]).sum(axis=2),axis=0))
+            abs_f_avg = np.mean(np.sqrt(np.square(f_list).sum(axis=2)),axis=0)
+            relative_error = (df_sqr/(abs_f_avg+level))
+            if mode == "mean":
+                relative_error = np.mean(relative_error)
+            elif mode == "max":
+                relative_error = np.max(relative_error)
             energy_error = np.sqrt(np.mean(np.power(np.array(energy_list)-np.mean(energy_list),2)))
-            # relative_energy_error = energy_error/np.mean(energy_list)
+            shortest_distance = get_shortest_distance(atoms)
+            property_list.append([time_list[ii], relative_error, energy_error, shortest_distance])
+        # property_list
+        property_list_np = np.array(property_list)
+        thermo = np.loadtxt("thermo.out")
+        thermo_new = compute_volume_from_thermo(thermo)[:,[0,2,3,-1]]
+        frame_property = np.concatenate((property_list_np,thermo_new),axis=1)
+        temperatures = thermo[:,0]
+        shortest_distances = frame_property[:,3]
+        result = np.where(np.logical_or(temperatures > 10000, shortest_distances < 0.5))
+        if result[0].size > 0:
+            # 获取第一个大于6000的数的行索引
+            first_row_index = result[0][0]
+        else:
+            first_row_index = None  # 如果没有找到任何大于6000的数
+
+        fmt = "%12.2f %12.2f %12.2f %12.2f %12.2f %12.2f %12.2f %12.2f"
+        header = f"{'time':^9} {'relative_error':^14} {'energy_error':^14} {'shortest_d':^14} {'temperature':^14} {'potential':^14} {'pressure':^14} {'volume':^14}"
+        np.savetxt("frame_property.txt", frame_property, fmt = fmt, header = header)
+
+        if first_row_index is not None:
+            if first_row_index < int(0.8*len(frame_property)):
+                new_total_time = time_list[first_row_index]*1000
+                dlog.warning(f"thermo.out has temperature > 6000 or shortest distance < 0.5 too early at frame {first_row_index}({new_total_time} ps), the gpumd task should be rerun")
+                raise RestartSignal(new_total_time)
             
-            if mode == "max":
-                uncertainty = np.max(relative_error)
-            elif mode == "mean":
-                uncertainty = np.mean(relative_error)
-            else:
-                raise KeyError("mode must be 'max' or 'mean'")
-            corr_deltaforcesquare = uncertainty * (absforce_avg[np.argmax(relative_error)]+level)
-            max_force_error = np.max(deltaforcesquare)
-            corr_absforce_avg = absforce_avg[np.argmax(relative_error)]
-            frame_list = [ii, uncertainty, corr_absforce_avg, corr_deltaforcesquare, max_force_error, energy_error]
-            if not energy_threshold:
-                energy_ok = True
-            elif energy_error < energy_threshold:
-                energy_ok = True
-            elif energy_error > energy_threshold:
-                energy_ok = False
-            else:
-                raise KeyError("energy_threshold must be a number or None")
-
-            if uncertainty < threshold_low and energy_ok:
-                frame_index["accurate"].append(frame_list)
-            elif uncertainty > threshold_high:
-                frame_index["failed"].append(frame_list)
-            else:
-                shortest_distance = get_shortest_distance(atoms_list[ii],candidate_but_failed_atom_index)
-                if shortest_distance < 0.6 or absforce_avg.any() > 75:
-                    frame_index["failed"].append(frame_list)
-                    candidate_but_failed_index.append(ii)
-                else:
-                    frame_index["candidate"].append(frame_list)
-        # dlog.info(f"accurate_shape:{np.array(frame_index['accurate']).shape}, failed_shape:{np.array(frame_index['failed']).shape},candidate_shape:{np.array(frame_index['candidate']).shape}")
-        
-        fmt = "%12d %12.2f %12.2f %12.2f %12.2f %12.2f"
-        header = "%12s %12s %12s %12s %12s %12s" % ("index", "uncertainty", "corr_absforce_avg", "corr_deltaforcesquare", "max_force_error", "energy_error")
-        # 保存函数
-        def save_sorted_data(filename, data, fmt, header):
-            np.savetxt(filename, data, fmt=fmt, header=header)
-        # 处理 "failed", "accurate", "candidate" 数据
-        if len(frame_index["failed"]) > 0:
-            failed_array = np.array(frame_index["failed"])
-            sorted_indices = failed_array[:, 0].argsort()
-            sorted_failed = failed_array[sorted_indices]
-            save_sorted_data("failed_error.txt", sorted_failed, fmt, header)
-
-        if len(frame_index["accurate"]) > 0:
-            accurate_array = np.array(frame_index["accurate"])
-            sorted_indices = accurate_array[:, 0].argsort()
-            sorted_accurate = accurate_array[sorted_indices]
-            save_sorted_data("accurate_error.txt", sorted_accurate, fmt, header)
-
-        if len(frame_index["candidate"]) > 0:
-            candidate_array = np.array(frame_index["candidate"])
-            sorted_indices = candidate_array[:, 0].argsort()
-            sorted_candidate = candidate_array[sorted_indices]
-            save_sorted_data("candidate_error.txt", sorted_candidate, fmt, header)
-
-        if candidate_but_failed_index:
-            dlog.warning(f"candidate_but_failed_index:{candidate_but_failed_index}") #,candidate_but_failed_atom_index:{candidate_but_failed_atom_index[random_indices.index(candidate_but_failed_index[0])]}")
-            atoms_candidate_but_failed = [atoms_list[i] for i in candidate_but_failed_index]
-            write(f"candidate_but_failed.pdb",atoms_candidate_but_failed)
-        del calculators
-        del calculator_fs
-        empty_cache()
-        return uncertainty,frame_index
+        return atoms_list, frame_property
 
     def make_label_task(self):
         label_engine = self.idata.get("label_engine","mattersim")
@@ -897,9 +962,14 @@ class Nepactive(object):
         atoms = read("candidate.traj",index=":")
         train:List[Atoms]=[]
         test:List[Atoms]=[]
+        failed:List[Atoms]=[]
+        failed_index=[]
         for i in range(len(atoms)):
             rand=random.random()
-            if rand <= train_ratio:
+            if np.max(np.abs(atoms[i].get_forces())) > 60:
+                failed.append(atoms[i])
+                failed_index.append(i)
+            elif rand <= train_ratio:
                 train.append(atoms[i])
             elif rand > train_ratio:
                 test.append(atoms[i])
@@ -909,7 +979,11 @@ class Nepactive(object):
             write_extxyz("iter_train.xyz",train)
         if test:
             write_extxyz("iter_test.xyz",test)
+        if failed:
+            write_extxyz("iter_failed.xyz",failed)
+            np.savetxt("failed_index.txt",failed_index,fmt="%12d")
         # 将原子信息写入train_iter.xyz文件
+        dlog.warning(f"failed structures:{len(failed_index)}")
         del calculator
         empty_cache()
 
