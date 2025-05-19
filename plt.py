@@ -20,24 +20,13 @@ default_cycler = (cycler(color=['b','r', 'g', 'y']) +
 plt.rc('axes', prop_cycle=default_cycler)
 
 def gpumdplt(total_time,time_step=0.2):
-    # 检查命令行参数，获取初始体积
-    #if len(sys.argv) < 2:
-    #    raise ValueError("需要提供初始体积作为命令行参数！")
-    # initial_volume = float(sys.argv[1])
 
-    # 读取数据
-
-    # print(f"dump_interval = {dump_interval}, time_step = {time_step}")
     data = np.loadtxt('thermo.out')
-    # print(f"lendata = {len(data)}, temperature = {data[:,0].shape}")
-    # dump_interval = 10  
+
     num_points = len(data)  # 数据点数
     total_time = total_time  # 总时间
     time = np.linspace(0, total_time, num_points, endpoint=False)/1000
-    # time = np.arange(0, len(data) * dump_interval * time_step / 1000, dump_interval * time_step/ 1000)
-    # print(f"time = {time.shape}, data = {data.shape}")
-    # print(f"time = {time}, data = {data}")
-    # 读取数据列
+
     temperature = data[:, 0]
     kinetic_energy = data[:, 1]
     potential_energy = data[:, 2]
@@ -68,8 +57,6 @@ def gpumdplt(total_time,time_step=0.2):
         volume = ax * bx_cy_bz + ay * bx_cz_by + az * bx_cx_by
         volume = np.abs(volume)  # 体积取绝对值
         
-        # 计算相对体积
-        # relative_volume = volume / initial_volume
     else:
         raise ValueError("不支持的 thermo.out 文件列数。期望 12 或 18 列。")
 
@@ -119,8 +106,8 @@ def gpumdplt(total_time,time_step=0.2):
     #if len(sys.argv) > 2 and sys.argv[2] == 'save':
     plt.savefig('thermo.png')
     plt.close()
-#else:
-#    plt.show()
+
+
 from pylab import *
 
 def nep_plt(testplt=True):
@@ -177,4 +164,64 @@ def nep_plt(testplt=True):
     legend(['xx', 'yy', 'zz', 'xy', 'yz', 'zx'])
     tight_layout()
     plt.savefig(f'{prefix}virial.png', dpi=300)  # 你可以修改文件名和文件格式
+    plt.close()
+
+def ase_plt():
+    data = np.loadtxt('md.log',skiprows=1,encoding='utf-8')
+    num_points = len(data)  # 数据点数
+    time = data[:, 0]
+
+    temperature = data[:, 4]
+    kinetic_energy = data[:, 3]
+    potential_energy = data[:, 2]
+    pressure_x = data[:, 6]
+    pressure_y = data[:, 7]
+    pressure_z = data[:, 8]
+    volume = data[:, 5]
+
+    # 子图
+    fig, axs = plt.subplots(2, 2, figsize=(11, 7.5), dpi=100)
+
+    # 温度
+    # print(f"time = {time.shape}, temperature = {temperature.shape}")
+    axs[0, 0].plot(time, temperature)
+    axs[0, 0].set_title('Temperature')
+    axs[0, 0].set_xlabel('Time (ps)')
+    axs[0, 0].set_ylabel('Temperature (K)')
+
+    # 势能与动能
+    color_potential = 'tab:orange'
+    color_kinetic = 'tab:green'
+    axs[0, 1].set_title(r'$P_E$ vs $K_E$')
+    axs[0, 1].set_xlabel('Time (ps)')
+    axs[0, 1].set_ylabel('Potential Energy (eV)', color=color_potential)
+    axs[0, 1].plot(time, potential_energy, color=color_potential)
+    axs[0, 1].tick_params(axis='y', labelcolor=color_potential)
+
+    axs_kinetic = axs[0, 1].twinx()
+    axs_kinetic.set_ylabel('Kinetic Energy (eV)', color=color_kinetic)
+    axs_kinetic.plot(time, kinetic_energy, color=color_kinetic)
+    axs_kinetic.tick_params(axis='y', labelcolor=color_kinetic)
+
+    # 压力
+    axs[1, 0].plot(time, pressure_x, label='Px')
+    axs[1, 0].plot(time, pressure_y, label='Py')
+    axs[1, 0].plot(time, pressure_z, label='Pz')
+    axs[1, 0].set_title('Pressure')
+    axs[1, 0].set_xlabel('Time (ps)')
+    axs[1, 0].set_ylabel('Pressure (GPa)')
+    axs[1, 0].legend()
+
+    # 相对体积
+    axs[1, 1].plot(time, volume, label='Volume')
+    axs[1, 1].set_title('Volume')
+    axs[1, 1].set_xlabel('Time (ps)')
+    axs[1, 1].set_ylabel('Volume')
+    axs[1, 1].legend()
+
+    plt.tight_layout()
+
+    # 保存或显示图像
+    #if len(sys.argv) > 2 and sys.argv[2] == 'save':
+    plt.savefig('thermo.png')
     plt.close()

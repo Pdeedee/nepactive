@@ -22,11 +22,13 @@ import random
 import numpy as np
 # from dpdispatcher.contexts.ssh_context import SSHSession
 
-def traj2tasks(traj_file:str,incar_file:str,potcar_file:str,frames:int, kpoint_file:Optional[str]=None):
+def traj2tasks(traj_file:str,incar_file:str,potcar_file:str,frames:int=0, kpoint_file:Optional[str]=None):
     """
     需要在当前文件夹下准备好candidate.traj文件与INCAR，POTCAR文件,然后执行nepactive --remote
     """
     traj = read(traj_file, index=':')
+    if frames == 0:
+        frames = len(traj)
     index = random.sample(range(len(traj)),frames)
     index.sort()
     index = np.array(index,dtype="int32")
@@ -293,12 +295,12 @@ class Remotetask:
 
     def setup(self):
         if not os.path.exists("task.000000"):
-            traj_file = self.idata.get('remotetask_traj_file')
-            incar_file = self.idata.get('incar_file')
-            potcar_file = self.idata.get('potcar_file')
-            frames = self.idata.get('remotetask_frames')
+            traj_file = self.idata.get('remotetask_traj_file',"candidate.traj")
+            incar_file = self.idata.get('incar_file',"INCAR")
+            potcar_file = self.idata.get('potcar_file',"POTCAR")
+            frames = self.idata.get('remotetask_frames',0)
             dlog.info(f"find traj_file:{traj_file}, incar_file:{incar_file}, potcar_file:{potcar_file}, frames:{frames}")
-            assert frames
+            # assert frames
             traj2tasks(traj_file=traj_file, incar_file=incar_file, potcar_file=potcar_file, frames=frames)
         self.fs = self.glob_files()
         self.tasks = self.glob_files("task.*")

@@ -186,7 +186,7 @@ class MolecularSolverOptimized:
         
         return best_solution, best_error
     
-    def solve(self, c, h, o, n, method='random'):
+    def solve(self, c, h, o, n, method=None):
         """使用指定方法找到解"""
         if method == 'exact':
             print(f"running exact_solution")
@@ -239,7 +239,7 @@ class MolecularSolverOptimized:
         return np.dot(self.atom_matrix, solution)
 
 
-def solve_molecular_distribution(c, h, o, n, method='exact', random_seed=None):
+def solve_molecular_distribution(c, h, o, n, method=None, random_seed=None):
     """对外暴露的主函数"""
     solver = MolecularSolverOptimized(random_seed)
     solution, error = solver.solve(c, h, o, n, method)

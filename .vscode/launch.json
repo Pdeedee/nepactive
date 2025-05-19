@@ -5,9 +5,9 @@
             "name": "Python: Current File",
             "type": "debugpy",
             "request": "launch",
-            "program": "/workplace/liuzf/code/nepactive/nepactive/main.py",
+            "program": "/workplace/liuzf/code/nepactive/src/nepactive/main.py",
             "console": "integratedTerminal",
-            "cwd": "/workplace/liuzf/code/nepactive/example/00.HMX"
+            "cwd": "/workplace/liuzf/code/nepactive/example/OB/00.CL20/combined/stable"
         }
     ]
 }

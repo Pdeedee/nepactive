@@ -110,14 +110,9 @@ class MTTK(MolecularDynamics):
         # self.pflag = [0]*6
         self.pmode = pmode
         self.t_start = t_start
-        self.triclinic = self.is_triclinic()
-        print(f"triclinic:{self.triclinic}")
         if self.pmode == "iso":
             self.iso =True
             self.pflag[0]=self.pflag[1]=self.pflag[2]=1
-            if self.triclinic:
-                print("triclinic cell, using pflag[3:6] to control the stress")
-                self.pflag[3]=self.pflag[4]=self.pflag[5]=1
         elif self.pmode == "x":
             self.iso = False
             self.pflag[0]=1
@@ -177,16 +172,6 @@ class MTTK(MolecularDynamics):
         
         assert self.md_tchain>0
 
-    def is_triclinic(self):
-        cell = self.atoms.get_cell(complete=True)
-        abdot = np.dot(cell[0], cell[1])
-        acdot = np.dot(cell[0], cell[2])
-        bcdot = np.dot(cell[1], cell[2])
-        if not np.isclose(abdot, 0) and not np.isclose(acdot, 0) and not np.isclose(bcdot, 0):
-            return True
-        else:
-            return False
-        
     def run(self, steps):
         """Perform a number of time steps."""
         for _ in range(steps):
@@ -364,11 +349,11 @@ class MTTK(MolecularDynamics):
 
     def couple_stress(self):
         stress = -self.atoms.get_stress(voigt=False,include_ideal_gas=True)
-        self.p_current = [0,0,0,0,0,0]
+        self.p_current = [0,0,0]
         if self.pmode == "iso":
             ave = np.trace(stress) / 3
             self.p_current[0] = self.p_current[1] = self.p_current[2] = ave
-            # print(f"p_ave{ave}")
+            print(f"p_ave{ave}")
         elif self.pmode == "x":
             self.p_current[0] = stress[0,0]
         elif self.pmode == "y":
@@ -377,11 +362,7 @@ class MTTK(MolecularDynamics):
             self.p_current[2] = stress[2,2]
         else:
             raise ValueError("pmode must be iso, x, y or z")
-        # print(f"ave:{ave/units.GPa},p_current:{[p/units.GPa for p in self.p_current]}")
-        self.p_current[3] = stress[1,2]
-        self.p_current[4] = stress[0,2]
-        self.p_current[5] = stress[0,1]
-    
+        print(f"ave:{ave/units.GPa},p_current:{[p/units.GPa for p in self.p_current]}")
     def get_t_vector(self):
         vel = self.atoms.get_velocities()
         masses = self.atoms.get_masses()
@@ -408,25 +389,15 @@ class MTTK(MolecularDynamics):
                 self.g_omega = (self.p_current[i]- self.p_hydro) * self.omega /self.mass_omega + term_one/self.mass_omega
                 self.v_omega[i] += self.g_omega * self.dt / 2
                 term_two += self.v_omega[i]
-
         term_two /= self.pdim * self.natom
-
-        for i in range(3,6,1):
-            if self.pflag[i]:
-                self.g_omega =  self.p_current[i] * self.omega / self.mass_omega
-                self.v_omega[i] += self.g_omega * self.dt / 2
-                # term_two += self.v_omega[i]
-
         self.mtk_term  = term_two
 
     def vel_baro(self):
-        dthalf = self.dt / 2
         factor = np.diag([np.exp(-(self.v_omega[i]+self.mtk_term)*self.dt/4) for i in range(3)])
         self.velocities = self.atoms.get_velocities()
         self.velocities = np.dot(self.velocities,factor)
-        if self.triclinic:
-            self.velocities[:,0] += -dthalf*(self.velocities[:,1]*self.v_omega[5] + self.velocities[:,2]*self.v_omega[4])
-            self.velocities[:,1] += -dthalf*self.velocities[:,2]*self.v_omega[3]
+        if not self.iso:
+            pass
         self.velocities = np.dot(self.velocities,factor)
         self.atoms.set_velocities(self.velocities)
 
@@ -437,74 +408,11 @@ class MTTK(MolecularDynamics):
         self.atoms.set_velocities(self.velocities)
 
     def update_volume(self):
-        cell = self.atoms.get_cell(complete=True)
-        e11 = cell[0, 0]
-        e21 = cell[1, 0]
-        e31 = cell[2, 0]
-        e22 = cell[1, 1]
-        e32 = cell[2, 1]
-        e33 = cell[2, 2]
-        if self.pflag[4]:
-            factor = np.exp(self.v_omega[0] * self.dt / 16)
-            e31 *= factor
-            e31 += self.v_omega[5] * e32 + self.v_omega[4] * e33
-            e31 *= factor
-        
-        if self.pflag[3]:
-            factor = np.exp(self.v_omega[1] * self.dt / 8)
-            e32 *= factor
-            e32 += self.v_omega[3] * e33
-            e32 *= factor
-
-        if self.pflag[5]:
-            factor = np.exp(self.v_omega[0] * self.dt / 8)
-            e21 *= factor
-            e21 += self.v_omega[5] * e22 
-            e21 *= factor
-
-        if self.pflag[4]:
-            factor = np.exp(self.v_omega[0] * self.dt / 16)
-            e31 *= factor
-            e31 += self.v_omega[5] * e32 + self.v_omega[4] * e33
-            e31 *= factor
-        
-        if self.pflag[0]:
-            factor = np.exp(self.v_omega[0] * self.dt / 2)
-            e11 *= factor
-
-        if self.pflag[1]:
-            factor = np.exp(self.v_omega[1] * self.dt / 2)
-            e22 *= factor
-            
-        if self.pflag[2]:
-            factor = np.exp(self.v_omega[2] * self.dt / 2)
-            e33 *= factor
-        
-        if self.pflag[4]:
-            factor = np.exp(self.v_omega[0] * self.dt / 16)
-            e31 *= factor
-            e31 += self.v_omega[5] * e32 + self.v_omega[4] * e33
-            e31 *= factor
-
-        if self.pflag[3]:
-            factor = np.exp(self.v_omega[1] * self.dt / 8)
-            e32 *= factor
-            e32 += self.v_omega[3] * e33
-            e32 *= factor
-
-        if self.pflag[5]:
-            factor = np.exp(self.v_omega[0] * self.dt / 8)
-            e21 *= factor
-            e21 += self.v_omega[5] * e22 
-            e21 *= factor
-
-        if self.pflag[4]:
-            factor = np.exp(self.v_omega[0] * self.dt / 16)
-            e31 *= factor
-            e31 += self.v_omega[5] * e32 + self.v_omega[4] * e33
-            e31 *= factor
-
-        self.atoms.set_cell(np.array([[e11, 0, 0], [e21, e22, 0], [e31, e32, e33]]), scale_atoms=True)
+        factor = np.diag([np.exp(self.v_omega[i] * self.dt / 2) for i in range(3)])
+        self.cell = self.atoms.get_cell(complete=True)
+        # print(f"cell:{self.cell},factor:{factor},v_omega:{self.v_omega}")
+        self.cell *= factor
+        self.atoms.set_cell(self.cell,scale_atoms=True)
 
     def update_pos(self):
         self.positions = self.atoms.get_positions()
@@ -554,7 +462,6 @@ class NPHugo(MTTK):
                           t_stop=self.t_stop, p_stop=p_stop, pmode=pmode,pfreq=pfreq,
                           tfreq=tfreq,tchain=tchain,pchain=pchain, **kwargs)
         self.print_init_parameters()
-
 
     def print_init_parameters(self):
         print(f"t0:{self.atoms.get_temperature()},p0:{self.p0},v0:{self.v0},e0:{self.e0},t_stop:{self.t_stop}"

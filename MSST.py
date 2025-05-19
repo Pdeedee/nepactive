@@ -10,8 +10,8 @@ from ase.md.md import MolecularDynamics
 # import sys
 import time
 
-class omdMSST(MolecularDynamics):
-    def __init__(self, atoms: Atoms,timestep: float,  loginterval, vbox:np.ndarray,
+class MSST(MolecularDynamics):
+    def __init__(self, atoms: Atoms,timestep: float,  loginterval, vbox:np.ndarray, shock_direction:str='y',
                    v0 = 0, p0 = 0,trajectory=None, logfile=None, qmass:int = 7e7,tscale = 0.01, 
                      v_shock = 8e3,append_trajectory:bool = False):
         MolecularDynamics.__init__(self, atoms, timestep, trajectory,
@@ -21,18 +21,19 @@ class omdMSST(MolecularDynamics):
         self.interval:int = 10
         self.atoms = atoms
         self.dt = timestep
+        if shock_direction == 'x':
+            self.sd = 0
+        elif shock_direction == 'y':
+            self.sd = 1
+        elif shock_direction == 'z':
+            self.sd = 2
         #MSST parameters
         self.initialized = 0
         self.v_shock =  v_shock * units.m / units.second 
-        # self.msst_direction = msst_direction
         self.V0 = v0# Initial volume
-        # self.P0 = self.atoms.get_stress(voigt=False)      # Initial pressure
         self.total_mass = atoms.get_masses().sum()  #mass convert
         self.atomnumbers = atoms.get_global_number_of_atoms()
-        # self.qmass = qmass * np.power((units._amu/units._me),2)/np.power(units.Bohr,4)   # Effective mass for the MSST piston
-        # self.qmass = qmass /np.power(units.Bohr,4)   # Effective mass for the MSST piston
         self.qmass = qmass 
-        self.vbox = vbox
         # self.bias = bias    # Scaling factor for energy conservation adjustments
         self.h0 = self.atoms.get_cell().T############################h与h0和晶体矩阵为转置关系
         self.velocity = self.atoms.get_velocities() 
@@ -44,7 +45,7 @@ class omdMSST(MolecularDynamics):
        
         self.hdot=self.h0@self.alpha*self.gammadot
         self.P0=p0
-        #self.P0 = self.vbox[1,:].T@self.atoms.get_stress(voigt=False)@self.vbox[1,:]#!!!!!!!!!!!!!!!!!!!!!
+
         self.h = self.h0
         self.V = np.abs(np.linalg.det(self.h))
         self.q = np.dot(np.linalg.inv(self.h),self.atoms.get_positions().T).T##############列向量
@@ -95,13 +96,7 @@ class omdMSST(MolecularDynamics):
             self.step()
             self.zero_center_of_mass_momentum()
             self.nsteps += 1
-            print(f"gamma:{self.cell_length_a},gammadot:{self.gammadot},hamiltonian:{self.Hamiltonian}")
-            # end_time = time.time()
-            # 计算时间差
-            # elapsed_time = end_time - start_time
-            # if self.nsteps % self.interval == 0:
-            # print(f"Step={self.nsteps},time={self.nsteps*self.dt/units.fs:.2f}")
-            # print("Elapsed time: ", elapsed_time,flush=True)            
+            print(f"gamma:{self.cell_length_a},gammadot:{self.gammadot},hamiltonian:{self.Hamiltonian}") 
             self.call_observers()
 
     def attach(self, function, interval=10, *args, **kwargs):
@@ -132,20 +127,23 @@ class omdMSST(MolecularDynamics):
             
     def first_half(self):
         self.dthalf = self.dt/2
-        self.h_inv = np.linalg.inv(self.h)
-        self.propagate_gammadot()
-        self.propagate_qdot()
-        self.atoms.set_velocities(np.dot(self.qdot, self.h.T))
+
+        self.propagate_voldot()
+        self.vsum = np.square(self.atoms.get_velocities()).sum(axis=1).sum()
+        oldv = self.atoms.get_velocities()
+        self.propagate_vel()
+        self.vsum = np.square(self.atoms.get_velocities()).sum(axis=1).sum()
+        self.atoms.set_velocities(oldv)
+        self.propagate_vel()
         self.update_half_volume()
-        #更新原子位置
-        self.update_q()
+        self.update_pos()
         self.update_half_volume()
 
     def second_half(self):
-        self.propagate_qdot()
-        self.atoms.set_velocities(np.dot(self.qdot, self.h.T))
-        # self.atoms.get_temperature()
-        self.propagate_gammadot()
+        self.propagate_vel()
+        self.vsum = np.square(self.atoms.get_velocities()).sum(axis=1).sum()
+        self.propagate_voldot()
+
     
     def get_center_of_mass_momentum(self):
         "Get the center of mass momentum."

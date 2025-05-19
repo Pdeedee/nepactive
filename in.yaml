@@ -2,58 +2,55 @@ project_name: "HMX"
 yaml_synchro: true
 
 ini_engine: "ase"
-ini_ase_ensemble_files: ["prep/npt.py", "prep/npt_stable.py","prep/msst.py"]
-python_interpreter: "/workplace/liuzf/miniforge3/envs/mattersim/bin/python"
+# ini_ase_ensemble_files: ["prep/npt.py"]
+python_interpreter: "/workplace/liuzf/miniforge3/envs/dev/bin/python"
 ini_frames: 1500
-ini_train_steps: 20000
+ini_train_steps: 10000
 training_ratio: 0.8
 pot_number: 4
 pot_inherit: true
-train_steps: 7000
+train_steps: 5000
 pot_file: "/home/liuzf/.local/mattersim/pretrained_models/mattersim-v1.0.0-1M.pth"
 
 #一定要检查POTCAR的顺序正不正确
-structure_prefix: "/workplace/liuzf/code/nepactive/example/00.HMX/prep"
-structure_files: ["HMX_opt.cif","N2_H2_CO2.pdb","N2_H2_NH3_CO2.pdb"]
+# structure_prefix: "/workplace/liuzf/code/nepactive/example/00.HMX/prep"
+structure_files: ["POSCAR", "init/struc.000/structure/stable.pdb","prep/final.xyz"]
 kpoints_file: "prep/KPOINTS"
 incar_file: "prep/INCAR"
 potcar_file: "prep/POTCAR"
 
 #model_devi
-uncertainty_threshold: [0.2,0.5]
+uncertainty_threshold: [0.3,1]
 uncertainty_level: 1
 uncertainty_mode: "max"
 energy_threshold: 1
 needed_frames: 10000
 
-max_candidate: 2000
+ini_run_steps: 100000
+max_candidate: 1000
 model_devi_time_step: 0.2
 gpu_available: [0,1,2,3]
 task_per_gpu: 1
 time_step: 0.2
+max_run_steps: 1000000
 model_devi_general:
   -
-    id: "0-10"
-    ensembles: ["msst"]
-    structure_id: [[0]]
-    # replicate_cell: "2 1 2"
-    each_run_steps: [60000, 100000, 200000, 200000, 400000, 400000, 400000,600000,800000]
-    v_shock: [7,8,9,10]
-    uncertainty_threshold: [0.15,1]
-    shock_direction: "y"
-  -
-    id: "11-24"
+    # id: "11-24"
     ensembles: ["nphugo"]
-    structure_id: [[0,1,2]]
-    pressure: [30,40,50,60]
-    # replicate_cell: "2 1 2"
-    each_run_steps: [40000,70000,80000,100000,200000,400000,800000]
-    v0: [2076]
-    e0: [-1360.4]
-    p0: [1]
-    v_shock: [9]
-    shock_direction: "y"
+    structure_id: [[2]]
+    pressure: [20,25,30,35,40,45,50,60]
+    # v0: [2076]
+    # e0: [-1360.4]
+    # p0: [1]
+    # v_shock: [9]
+    # shock_direction: "y"
 #目前只有相对误差
+# model_devi_general:
+  -
+    ensembles: ["nphugo"]
+    structure_id: [[0,1]]
+    pressure: [20,25,30,35,40,45,50,55,60]
+
 
 
 #ssh_machine
@@ -76,11 +73,21 @@ slurm_header_script:
   - "module load mpi/oneAPI/2022.1"
   - "export PATH=/public1/home/sch9797/software-sch9797/6.3.0-vtst+opt+sol+wannier:$PATH"
 
+
+shock_test_interval: 1
+shock_test_begin_step: 400000
+if_stable_run: true
+
 stable:
-  structure: "HMX_opt.cif"
-  struc_num: 4
-  pressures: [20,25,30,35,40,45,50]
-  task_per_gpu: 4
+  dump_freq: 10
+  structure: "POSCAR"
+  struc_num: 0
+  rho: 1.62
+  pressures: [20,40,60,80]
+  gpumd_pressure_list: [20,25,30,35,40,45,50,55,60]
+  task_per_gpu: 1
   gpu_available: [0,1,2,3]
   python_interpreter: "/workplace/liuzf/miniforge3/envs/dev/bin/python"
-  steps: 400000
+  steps: 40000
+  gpumd_steps: 400000
+  original_make: true
